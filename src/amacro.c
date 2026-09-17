@@ -30,6 +30,7 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "common.h"
 #include "gerbv.h"
 #include "gerb_file.h"
 #include "amacro.h"
@@ -75,10 +76,31 @@ new_amacro(void)
 
 
 /*
- * Defines precedence of operators used in aperture macros
+ * Operations on the operator stack. The stack is used in the "shunting yard
+ * algorithm" to achieve precedence. An element is either the opcode of a
+ * binary operator or a negative marker (MATH_OP_*); markers never become
+ * instructions, see emit_math_op(). When the stack is full, MATH_OP_PUSH()
+ * drops the operator and raises math_op_overflow; parse_aperture_macro()
+ * reports the dropped operator and goes on.
+ */
+#define MATH_OP_STACK_SIZE 64
+#define MATH_OP_UMINUS (-1) /* unary minus; emits SUB after the operand */
+#define MATH_OP_PUSH(val) do { \
+	if (math_op_idx < MATH_OP_STACK_SIZE) \
+	    math_op[math_op_idx++] = (val); \
+	else \
+	    math_op_overflow = 1; \
+    } while (0)
+#define MATH_OP_POP math_op[--math_op_idx]
+#define MATH_OP_TOP ((math_op_idx > 0)?math_op[math_op_idx - 1]:GERBV_OPCODE_NOP)
+#define MATH_OP_EMPTY (math_op_idx == 0)
+
+
+/*
+ * Defines the precedence of the operators used in aperture macros.
  */
 static int
-math_op_prec(gerbv_opcodes_t math_op)
+math_op_prec(int math_op)
 {
     switch (math_op) {
     case GERBV_OPCODE_ADD:
@@ -87,6 +109,8 @@ math_op_prec(gerbv_opcodes_t math_op)
     case GERBV_OPCODE_MUL:
     case GERBV_OPCODE_DIV:
 	return 2;
+    case MATH_OP_UMINUS:
+	return 3;
     default:
 	;
     }
@@ -96,28 +120,16 @@ math_op_prec(gerbv_opcodes_t math_op)
 
 
 /*
- * Operations on the operator stack. The operator stack is used in the
- * "shunting yard algorithm" to achive precedence.
- * Aperture macros has a very limited set of operators and matching precedence,
- * so it is solved by a small array and an index to that array.
- */
-#define MATH_OP_STACK_SIZE 2
-#define MATH_OP_PUSH(val) math_op[math_op_idx++] = val
-#define MATH_OP_POP math_op[--math_op_idx]
-#define MATH_OP_TOP (math_op_idx > 0)?math_op[math_op_idx - 1]:GERBV_OPCODE_NOP
-#define MATH_OP_EMPTY (math_op_idx == 0)
-
-
-/*
  * Appends the instruction evaluating operator math_op after ip and returns
  * the new last instruction.
  */
 static gerbv_instruction_t *
-emit_math_op(gerbv_instruction_t *ip, gerbv_opcodes_t math_op)
+emit_math_op(gerbv_instruction_t *ip, int math_op)
 {
     ip->next = new_instruction(); /* XXX Check return value */
     ip = ip->next;
-    ip->opcode = math_op;
+    ip->opcode = (math_op == MATH_OP_UMINUS) ? GERBV_OPCODE_SUB
+					     : (gerbv_opcodes_t)math_op;
     return ip;
 } /* emit_math_op */
 
@@ -131,10 +143,10 @@ parse_aperture_macro(gerb_file_t *fd)
     gerbv_amacro_t *amacro;
     gerbv_instruction_t *ip = NULL;
     int primitive = 0, c, found_primitive = 0;
-    gerbv_opcodes_t math_op[MATH_OP_STACK_SIZE];
+    int math_op[MATH_OP_STACK_SIZE];
     int math_op_idx = 0;
+    int math_op_overflow = 0;
     int operand_expected = 0; /* an operand comes next; a sign is unary */
-    int neg = 0; /* negative numbers succeding , */
     unsigned char continueLoop = 1;
     int equate = 0;
 
@@ -199,11 +211,13 @@ parse_aperture_macro(gerb_file_t *fd)
 	case '=':
 	    if (equate) {
 		found_primitive = 1;
+		operand_expected = 1;
 	    }
 	    break;
 	case ',':
 	    if (!found_primitive) {
 		found_primitive = 1;
+		operand_expected = 1;
 		break;
 	    }
 	    while (!MATH_OP_EMPTY)
@@ -211,6 +225,8 @@ parse_aperture_macro(gerb_file_t *fd)
 	    operand_expected = 1;
 	    break;
 	case '+':
+	    if (operand_expected)
+		break; /* unary plus: "+a" is "a" */
 	    while ((!MATH_OP_EMPTY) &&
 		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_ADD)))
 		ip = emit_math_op(ip, MATH_OP_POP);
@@ -219,14 +235,25 @@ parse_aperture_macro(gerb_file_t *fd)
 	    break;
 	case '-':
 	    if (operand_expected) {
-		neg = 1;
-		operand_expected = 0;
+		/*
+		 * The unary minus is compiled as "0 - a": emit PUSH 0 now
+		 * and SUB once the operand is complete.
+		 */
+		MATH_OP_PUSH(MATH_OP_UMINUS);
+		if (math_op_overflow)
+		    break; /* the '-' is dropped, so no 0 either */
+		ip->next = new_instruction(); /* XXX Check return value */
+		ip = ip->next;
+		ip->opcode = GERBV_OPCODE_PUSH;
+		ip->data.fval = 0.0;
+		amacro->nuf_push++;
 		break;
 	    }
 	    while((!MATH_OP_EMPTY) &&
 		  (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_SUB)))
 		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_SUB);
+	    operand_expected = 1;
 	    break;
 	case '/':
 	    while ((!MATH_OP_EMPTY)  &&
@@ -279,9 +306,6 @@ parse_aperture_macro(gerb_file_t *fd)
 	    ip->opcode = GERBV_OPCODE_PUSH;
 	    amacro->nuf_push++;
 	    ip->data.fval = gerb_fgetdouble(fd);
-	    if (neg) 
-		ip->data.fval = -ip->data.fval;
-	    neg = 0;
 	    operand_expected = 0;
 	    break;
 	case '%':
@@ -292,13 +316,20 @@ parse_aperture_macro(gerb_file_t *fd)
 	    /* Whitespace */
 	    break;
 	}
+	if (math_op_overflow) {
+	    GERB_COMPILE_ERROR(_("Arithmetic expression in aperture macro %s "
+				 "is too complex (operator stack overflow); "
+				 "operator ignored"),
+			       amacro->name ? amacro->name : "");
+	    math_op_overflow = 0;
+	}
 	if (c == EOF) {
 	    continueLoop = 0;
 	}
     }
     free (amacro);
     return NULL;
-}
+} /* parse_aperture_macro */
 
 
 void 
