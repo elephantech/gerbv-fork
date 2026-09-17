@@ -109,6 +109,20 @@ math_op_prec(gerbv_opcodes_t math_op)
 
 
 /*
+ * Appends the instruction evaluating operator math_op after ip and returns
+ * the new last instruction.
+ */
+static gerbv_instruction_t *
+emit_math_op(gerbv_instruction_t *ip, gerbv_opcodes_t math_op)
+{
+    ip->next = new_instruction(); /* XXX Check return value */
+    ip = ip->next;
+    ip->opcode = math_op;
+    return ip;
+} /* emit_math_op */
+
+
+/*
  * Parses the definition of an aperture macro
  */
 gerbv_amacro_t *
@@ -119,7 +133,7 @@ parse_aperture_macro(gerb_file_t *fd)
     int primitive = 0, c, found_primitive = 0;
     gerbv_opcodes_t math_op[MATH_OP_STACK_SIZE];
     int math_op_idx = 0;
-    int comma = 0; /* Just read an operator (one of '*+X/) */
+    int operand_expected = 0; /* an operand comes next; a sign is unary */
     int neg = 0; /* negative numbers succeding , */
     unsigned char continueLoop = 1;
     int equate = 0;
@@ -155,17 +169,14 @@ parse_aperture_macro(gerb_file_t *fd)
 		ip->opcode = GERBV_OPCODE_PPUSH;
 		amacro->nuf_push++;
 		ip->data.ival = gerb_fgetint(fd, NULL);
-		comma = 0;
+		operand_expected = 0;
 	    } else {
 		equate = gerb_fgetint(fd, NULL);
 	    }
 	    break;
 	case '*':
-	    while (!MATH_OP_EMPTY) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
+	    while (!MATH_OP_EMPTY)
+		ip = emit_math_op(ip, MATH_OP_POP);
 	    /*
 	     * Check is due to some gerber files has spurious empty lines.
 	     * (EagleCad of course).
@@ -195,57 +206,42 @@ parse_aperture_macro(gerb_file_t *fd)
 		found_primitive = 1;
 		break;
 	    }
-	    while (!MATH_OP_EMPTY) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
-	    comma = 1;
+	    while (!MATH_OP_EMPTY)
+		ip = emit_math_op(ip, MATH_OP_POP);
+	    operand_expected = 1;
 	    break;
 	case '+':
 	    while ((!MATH_OP_EMPTY) &&
-		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_ADD))) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
+		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_ADD)))
+		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_ADD);
-	    comma = 1;
+	    operand_expected = 1;
 	    break;
 	case '-':
-	    if (comma) {
+	    if (operand_expected) {
 		neg = 1;
-		comma = 0;
+		operand_expected = 0;
 		break;
 	    }
 	    while((!MATH_OP_EMPTY) &&
-		  (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_SUB))) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
+		  (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_SUB)))
+		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_SUB);
 	    break;
 	case '/':
 	    while ((!MATH_OP_EMPTY)  &&
-		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_DIV))) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
+		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_DIV)))
+		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_DIV);
-	    comma = 1;
+	    operand_expected = 1;
 	    break;
 	case 'X':
 	case 'x':
 	    while ((!MATH_OP_EMPTY) &&
-		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_MUL))) {
-		ip->next = new_instruction(); /* XXX Check return value */
-		ip = ip->next;
-		ip->opcode = MATH_OP_POP;
-	    }
+		   (math_op_prec(MATH_OP_TOP) >= math_op_prec(GERBV_OPCODE_MUL)))
+		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_MUL);
-	    comma = 1;
+	    operand_expected = 1;
 	    break;
 	case '0':
 	    /*
@@ -286,7 +282,7 @@ parse_aperture_macro(gerb_file_t *fd)
 	    if (neg) 
 		ip->data.fval = -ip->data.fval;
 	    neg = 0;
-	    comma = 0;
+	    operand_expected = 0;
 	    break;
 	case '%':
 	    gerb_ungetc(fd);  /* Must return with % first in string
