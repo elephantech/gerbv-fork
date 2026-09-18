@@ -85,6 +85,7 @@ new_amacro(void)
  */
 #define MATH_OP_STACK_SIZE 64
 #define MATH_OP_UMINUS (-1) /* unary minus; emits SUB after the operand */
+#define MATH_OP_LPAREN (-2) /* '('; stops popping until the matching ')' */
 #define MATH_OP_PUSH(val) do { \
 	if (math_op_idx < MATH_OP_STACK_SIZE) \
 	    math_op[math_op_idx++] = (val); \
@@ -132,6 +133,30 @@ emit_math_op(gerbv_instruction_t *ip, int math_op)
 					     : (gerbv_opcodes_t)math_op;
     return ip;
 } /* emit_math_op */
+
+
+/*
+ * Emits all operators left on the stack at the end of an expression. A '('
+ * that was never closed is reported and dropped, so the expression is
+ * evaluated as if the bracket were closed here.
+ */
+static gerbv_instruction_t *
+flush_math_ops(gerbv_instruction_t *ip, int *math_op, int *math_op_idx,
+	       const char *amacro_name)
+{
+    while (*math_op_idx > 0) {
+	int op = math_op[--*math_op_idx];
+
+	if (op == MATH_OP_LPAREN) {
+	    GERB_COMPILE_ERROR(_("Unbalanced '(' in aperture macro %s; "
+				 "closed at the end of the expression"),
+			       amacro_name ? amacro_name : "");
+	    continue;
+	}
+	ip = emit_math_op(ip, op);
+    }
+    return ip;
+} /* flush_math_ops */
 
 
 /*
@@ -187,8 +212,7 @@ parse_aperture_macro(gerb_file_t *fd)
 	    }
 	    break;
 	case '*':
-	    while (!MATH_OP_EMPTY)
-		ip = emit_math_op(ip, MATH_OP_POP);
+	    ip = flush_math_ops(ip, math_op, &math_op_idx, amacro->name);
 	    /*
 	     * Check is due to some gerber files has spurious empty lines.
 	     * (EagleCad of course).
@@ -220,8 +244,7 @@ parse_aperture_macro(gerb_file_t *fd)
 		operand_expected = 1;
 		break;
 	    }
-	    while (!MATH_OP_EMPTY)
-		ip = emit_math_op(ip, MATH_OP_POP);
+	    ip = flush_math_ops(ip, math_op, &math_op_idx, amacro->name);
 	    operand_expected = 1;
 	    break;
 	case '+':
@@ -269,6 +292,28 @@ parse_aperture_macro(gerb_file_t *fd)
 		ip = emit_math_op(ip, MATH_OP_POP);
 	    MATH_OP_PUSH(GERBV_OPCODE_MUL);
 	    operand_expected = 1;
+	    break;
+	case '(':
+	    MATH_OP_PUSH(MATH_OP_LPAREN);
+	    operand_expected = 1;
+	    break;
+	case ')':
+	    if (operand_expected && MATH_OP_TOP == MATH_OP_LPAREN) {
+		GERB_COMPILE_ERROR(_("Empty brackets in aperture macro %s; "
+				     "ignored"),
+				   amacro->name ? amacro->name : "");
+		math_op_idx--; /* drop the '(' marker; operand still expected */
+		break;
+	    }
+	    while ((!MATH_OP_EMPTY) && (MATH_OP_TOP != MATH_OP_LPAREN))
+		ip = emit_math_op(ip, MATH_OP_POP);
+	    if (MATH_OP_EMPTY)
+		GERB_COMPILE_ERROR(_("Unbalanced ')' in aperture macro %s; "
+				     "opened at the start of the expression"),
+				   amacro->name ? amacro->name : "");
+	    else
+		math_op_idx--; /* drop the '(' marker */
+	    operand_expected = 0;
 	    break;
 	case '0':
 	    /*
